@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 # Daytona Domain Setup
-# Automated deployment of Daytona OSS behind a custom domain with Caddy + TLS.
-# Supports: Ubuntu, Debian, Fedora, CentOS, RHEL, Rocky, AlmaLinux, macOS
+# Automated deployment of Daytona OSS for use behind an existing nginx reverse proxy.
+# This script does not install packages, change firewall rules, or configure host TLS.
+# Supports: Linux and macOS with Docker already installed.
 # Usage: ./setup.sh
 set -euo pipefail
 
@@ -21,11 +22,8 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # ── Globals (filled during input/detection) ─────────────────
-OS="" PKG_MANAGER="" FIREWALL="" ARCH="" CADDY_OS="" CADDY_BIN="" CADDY_CONF_DIR=""
-DOMAIN="" EMAIL="" ADMIN_EMAIL="" ADMIN_PASSWORD="" ADMIN_PASSWORD_HASH=""
-DNS_PROVIDER_NAME="" DNS_CADDY_MODULE=""
-DNS_TLS_BLOCK="" DNS_ENV_NAME="" DNS_ENV_NAME_EXTRA=""
-DNS_TOKEN="" DNS_TOKEN_EXTRA=""
+OS="" ARCH=""
+DOMAIN="" ADMIN_EMAIL="" ADMIN_PASSWORD="" ADMIN_PASSWORD_HASH=""
 ENCRYPTION_KEY="" ENCRYPTION_SALT=""
 PROXY_API_KEY="" RUNNER_API_KEY="" SSH_GATEWAY_API_KEY=""
 PGADMIN_EMAIL="" PGADMIN_PASSWORD=""
@@ -94,17 +92,10 @@ detect_platform() {
     case "$(uname -s)" in
         Darwin)
             OS="macos"
-            PKG_MANAGER="brew"
-            FIREWALL="none"
-            CADDY_OS="darwin"
-            CADDY_BIN="/usr/local/bin/caddy"
-            CADDY_CONF_DIR="/usr/local/etc/caddy"
             info "Detected macOS ($ARCH)"
             return
             ;;
-        Linux)
-            CADDY_OS="linux"
-            ;;
+        Linux) ;;
         *) die "Unsupported operating system: $(uname -s)" ;;
     esac
 
@@ -113,20 +104,17 @@ detect_platform() {
     # shellcheck disable=SC1091
     . /etc/os-release
 
-    CADDY_BIN="/usr/bin/caddy"
-    CADDY_CONF_DIR="/etc/caddy"
-
     case "${ID:-}" in
         ubuntu|debian)
-            OS="$ID"; PKG_MANAGER="apt"; FIREWALL="ufw" ;;
+            OS="$ID" ;;
         fedora)
-            OS="fedora"; PKG_MANAGER="dnf"; FIREWALL="firewalld" ;;
+            OS="fedora" ;;
         centos|rhel|rocky|almalinux)
-            OS="$ID"; PKG_MANAGER="dnf"; FIREWALL="firewalld" ;;
+            OS="$ID" ;;
         *)
             case "${ID_LIKE:-}" in
-                *debian*|*ubuntu*) OS="debian"; PKG_MANAGER="apt"; FIREWALL="ufw" ;;
-                *fedora*|*rhel*)   OS="fedora"; PKG_MANAGER="dnf"; FIREWALL="firewalld" ;;
+                *debian*|*ubuntu*) OS="debian" ;;
+                *fedora*|*rhel*)   OS="fedora" ;;
                 *) die "Unsupported OS: ${PRETTY_NAME:-$ID}" ;;
             esac ;;
     esac
@@ -136,12 +124,14 @@ detect_platform() {
 
 # ── Input Collection ────────────────────────────────────────
 collect_input() {
-    printf "\n${BOLD}  Daytona Domain Setup${NC}\n"
-    printf "  ═══════════════════════\n\n"
+    printf "\n${BOLD}  Daytona Docker Setup${NC}\n"
+    printf "  ═════════════════════\n\n"
+    printf "  This configures Daytona containers for an existing nginx reverse proxy.\n"
+    printf "  It will not install packages, open firewall ports, or configure Caddy/TLS.\n\n"
 
     # Domain
-    # Restrict to RFC 1123 hostname syntax. The value is substituted into the
-    # Caddyfile, docker-compose env vars, and Dex config; accepting only
+    # Restrict to RFC 1123 hostname syntax. The value is substituted into
+    # docker-compose env vars and Dex config; accepting only
     # letters/digits/hyphens/dots prevents a typo from corrupting those files.
     while true; do
         printf "  Domain (e.g. daytona.example.com): "; read -r DOMAIN
@@ -155,81 +145,12 @@ collect_input() {
         break
     done
 
-    # DNS provider
-    printf "\n  DNS Provider:\n"
-    printf "    1) Cloudflare\n"
-    printf "    2) DigitalOcean\n"
-    printf "    3) AWS Route 53\n"
-    printf "    4) Google Cloud DNS\n"
-    printf "    5) Hetzner\n"
-    printf "    6) Namecheap\n"
-    while true; do
-        printf "  Select [1-6]: "; read -r choice
-        case "$choice" in
-            1) DNS_PROVIDER_NAME="Cloudflare"
-               DNS_CADDY_MODULE="github.com/caddy-dns/cloudflare"
-               DNS_TLS_BLOCK="dns cloudflare {env.CLOUDFLARE_API_TOKEN}"
-               DNS_ENV_NAME="CLOUDFLARE_API_TOKEN"; break ;;
-            2) DNS_PROVIDER_NAME="DigitalOcean"
-               DNS_CADDY_MODULE="github.com/caddy-dns/digitalocean"
-               DNS_TLS_BLOCK="dns digitalocean {env.DO_AUTH_TOKEN}"
-               DNS_ENV_NAME="DO_AUTH_TOKEN"; break ;;
-            3) DNS_PROVIDER_NAME="AWS Route 53"
-               DNS_CADDY_MODULE="github.com/caddy-dns/route53"
-               DNS_TLS_BLOCK="dns route53 {
-            access_key_id {env.AWS_ACCESS_KEY_ID}
-            secret_access_key {env.AWS_SECRET_ACCESS_KEY}
-        }"
-               DNS_ENV_NAME="AWS_ACCESS_KEY_ID"
-               DNS_ENV_NAME_EXTRA="AWS_SECRET_ACCESS_KEY"; break ;;
-            4) DNS_PROVIDER_NAME="Google Cloud DNS"
-               DNS_CADDY_MODULE="github.com/caddy-dns/googleclouddns"
-               DNS_TLS_BLOCK="dns googleclouddns {
-            gcp_project {env.GCP_PROJECT}
-            service_account_json {env.GCP_SERVICE_ACCOUNT_JSON}
-        }"
-               DNS_ENV_NAME="GCP_PROJECT"
-               DNS_ENV_NAME_EXTRA="GCP_SERVICE_ACCOUNT_JSON"; break ;;
-            5) DNS_PROVIDER_NAME="Hetzner"
-               DNS_CADDY_MODULE="github.com/caddy-dns/hetzner"
-               DNS_TLS_BLOCK="dns hetzner {env.HETZNER_API_TOKEN}"
-               DNS_ENV_NAME="HETZNER_API_TOKEN"; break ;;
-            6) DNS_PROVIDER_NAME="Namecheap"
-               DNS_CADDY_MODULE="github.com/caddy-dns/namecheap"
-               DNS_TLS_BLOCK="dns namecheap {
-            api_key {env.NAMECHEAP_API_KEY}
-            user {env.NAMECHEAP_API_USER}
-        }"
-               DNS_ENV_NAME="NAMECHEAP_API_KEY"
-               DNS_ENV_NAME_EXTRA="NAMECHEAP_API_USER"; break ;;
-            *) fail "Invalid choice" ;;
-        esac
-    done
-
-    # DNS credentials
-    printf "\n  %s %s: " "$DNS_PROVIDER_NAME" "$DNS_ENV_NAME"
-    read -rs DNS_TOKEN; echo
-    [ -z "$DNS_TOKEN" ] && die "Token is required"
-
-    if [ -n "${DNS_ENV_NAME_EXTRA:-}" ]; then
-        printf "  %s %s: " "$DNS_PROVIDER_NAME" "$DNS_ENV_NAME_EXTRA"
-        read -rs DNS_TOKEN_EXTRA; echo
-        [ -z "$DNS_TOKEN_EXTRA" ] && die "Required"
-    fi
-
-    # Email — basic but stricter than just "contains @". Caddy sends this to
-    # Let's Encrypt; an obviously-bogus value gets the ACME account rejected.
+    # Email validation for admin/service logins.
     local _email_re='^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$'
-    while true; do
-        printf "\n  Email (for Let's Encrypt certificates): "; read -r EMAIL
-        EMAIL="$(echo "$EMAIL" | tr -d '[:space:]')"
-        echo "$EMAIL" | grep -qE "$_email_re" && break
-        fail "Must be a valid email"
-    done
 
     # Admin email
     while true; do
-        printf "  Admin login email: "; read -r ADMIN_EMAIL
+        printf "\n  Admin login email: "; read -r ADMIN_EMAIL
         ADMIN_EMAIL="$(echo "$ADMIN_EMAIL" | tr -d '[:space:]')"
         echo "$ADMIN_EMAIL" | grep -qE "$_email_re" && break
         fail "Must be a valid email"
@@ -249,8 +170,7 @@ collect_input() {
     printf "\n${BOLD}  Service Credentials${NC}\n"
     printf "  These replace default placeholder credentials and secure services behind HTTPS.\n\n"
 
-    # Usernames are substituted into docker-compose env vars and, for the
-    # registry user, into the Caddyfile basic_auth directive. Restrict the
+    # Usernames are substituted into docker-compose env vars. Restrict the
     # charset so a stray quote or brace can't corrupt the config.
     local _user_re='^[a-zA-Z0-9_-]{1,63}$'
 
@@ -335,8 +255,6 @@ collect_input() {
     printf "\n${BOLD}  Configuration${NC}\n"
     printf "  ─────────────\n"
     printf "  Domain:       %s\n" "$DOMAIN"
-    printf "  DNS Provider: %s\n" "$DNS_PROVIDER_NAME"
-    printf "  Email:        %s\n" "$EMAIL"
     printf "  Admin:        %s\n" "$ADMIN_EMAIL"
     printf "  DB user:      %s\n" "$DB_USER"
     printf "  PgAdmin:      %s\n" "$PGADMIN_EMAIL"
@@ -355,22 +273,16 @@ step_clean() {
     # Kill any orphaned daytona containers from a previous failed run
     docker ps -aq --filter "name=daytona-" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
     # Clean transient files only — preserve $REPO_DIR so re-runs are non-destructive
-    # (step_clone is now idempotent and skips when the repo is already present)
-    rm -rf /tmp/dashboard-extract /opt/daytona-dashboard-assets "$HOME/.daytona-dashboard-assets"
+    # and avoid touching host-level Daytona paths.
+    rm -rf /tmp/dashboard-extract
 }
 
-step_packages() {
+step_prerequisites() {
     command -v docker >/dev/null 2>&1 || die "Docker is not installed. See https://docs.docker.com/engine/install/"
     docker compose version >/dev/null 2>&1 || die "docker compose v2 plugin not found"
-
-    case "$PKG_MANAGER" in
-        apt) apt-get update -y && apt-get install -y git curl openssl apache2-utils ufw ;;
-        dnf) dnf install -y git curl openssl httpd-tools firewalld ;;
-        brew)
-            command -v brew >/dev/null 2>&1 || die "Homebrew is not installed. See https://brew.sh"
-            command -v htpasswd >/dev/null 2>&1 || brew install httpd
-            ;;
-    esac
+    command -v git >/dev/null 2>&1 || die "git is required to clone Daytona"
+    command -v curl >/dev/null 2>&1 || die "curl is required for local verification"
+    command -v openssl >/dev/null 2>&1 || die "openssl is required to generate secrets"
 }
 
 step_clone() {
@@ -382,13 +294,22 @@ step_clone() {
 }
 
 step_secrets() {
+    _bcrypt_hash() {
+        if command -v htpasswd >/dev/null 2>&1; then
+            printf '%s' "$1" | htpasswd -niBC 10 "" | cut -d: -f2
+            return
+        fi
+
+        # Keep host setup untouched: if htpasswd is absent, use a short-lived Docker container.
+        printf '%s' "$1" | docker run --rm -i httpd:2.4-alpine htpasswd -niBC 10 "" | cut -d: -f2
+    }
+
     ENCRYPTION_KEY=$(openssl rand -hex 16)
     ENCRYPTION_SALT=$(openssl rand -hex 16)
     PROXY_API_KEY=$(openssl rand -hex 16)
     RUNNER_API_KEY=$(openssl rand -hex 16)
     SSH_GATEWAY_API_KEY=$(openssl rand -hex 16)
-    # Hash passwords via stdin (-i) so they never appear in process arguments
-    ADMIN_PASSWORD_HASH=$(printf '%s' "$ADMIN_PASSWORD" | htpasswd -niBC 10 "" | cut -d: -f2)
+    ADMIN_PASSWORD_HASH=$(_bcrypt_hash "$ADMIN_PASSWORD")
     HEALTH_CHECK_KEY=$(openssl rand -hex 16)
     OTEL_COLLECTOR_KEY=$(openssl rand -hex 16)
 }
@@ -496,22 +417,24 @@ step_compose() {
         ' "$cf" > "${cf}.tmp" && mv "${cf}.tmp" "$cf"
     fi
 
-    # Remap auxiliary service ports to localhost-only offset ports so they don't
-    # collide with Caddy, which listens on the original ports for HTTPS.
-    # Actual compose file uses: 5050:80 (pgadmin), 5100:80 (registry-ui), 9001:9001 (minio)
-    _remap_port() {
-        local host_port="$1" new_host_port="$2"
-        awk -v hp="$host_port" -v nhp="$new_host_port" '{
-            # Match "- HP:CP" or "- \"HP:CP\"" where HP is the host port
-            if (match($0, hp ":[0-9]+")) {
-                sub(hp ":", "127.0.0.1:" nhp ":")
+    # Bind published ports to localhost only. Public access should go through
+    # the operator's existing nginx reverse proxy, not directly to containers.
+    _bind_localhost_port() {
+        local host_port="$1"
+        awk -v hp="$host_port" '{
+            if ($0 ~ "127\\.0\\.0\\.1:" hp ":") {
+                print
+            } else if ($0 ~ "- \\\"?" hp ":[0-9]+") {
+                sub(hp ":", "127.0.0.1:" hp ":")
+                print
+            } else {
+                print
             }
-            print
         }' "$cf" > "${cf}.tmp" && mv "${cf}.tmp" "$cf"
     }
-    _remap_port 5050 15050
-    _remap_port 5100 15100
-    _remap_port 9001 19001
+    for port in 3000 3003 4000 2222 5556 5050 5100 6000 1080 9001 16686; do
+        _bind_localhost_port "$port"
+    done
 
     # Update PostgreSQL credentials (db service + API service connection)
     _set POSTGRES_USER         "$DB_USER"
@@ -560,233 +483,6 @@ step_compose() {
 
     # Restrict permissions — compose file now contains plaintext credentials
     chmod 600 "$cf"
-}
-
-step_firewall() {
-    case "$FIREWALL" in
-        ufw)
-            ufw allow 22/tcp && ufw allow 80/tcp && ufw allow 443/tcp && ufw allow 2222/tcp \
-                && ufw allow 5050/tcp && ufw allow 5100/tcp && ufw allow 9001/tcp
-            ufw --force enable
-            ;;
-        firewalld)
-            systemctl enable --now firewalld
-            for p in 22/tcp 80/tcp 443/tcp 2222/tcp 5050/tcp 5100/tcp 9001/tcp; do
-                firewall-cmd --permanent --add-port="$p"
-            done
-            firewall-cmd --permanent --add-masquerade
-            firewall-cmd --reload
-            # SELinux: Caddy's binary at /usr/bin/caddy is auto-labeled httpd_exec_t on
-            # Fedora and runs in the httpd_t domain under systemd. By default httpd_t cannot
-            # bind the auxiliary ports (5050/5100/9001), so we relabel them. Caddy's storage
-            # is moved to /var/lib/caddy (the conventional location) via XDG_DATA_HOME in the
-            # systemd unit, which avoids the /root home-directory traversal entirely.
-            # No-op if SELinux is disabled.
-            if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" != "Disabled" ]; then
-                command -v semanage >/dev/null 2>&1 || dnf install -y policycoreutils-python-utils >/dev/null 2>&1 || true
-                if command -v semanage >/dev/null 2>&1; then
-                    # Allow httpd_t to bind the aux ports (TCP for h1/h2, UDP for h3 QUIC)
-                    for proto in tcp udp; do
-                        for p in 5050 5100 9001; do
-                            semanage port -m -t http_port_t -p "$proto" "$p" 2>/dev/null || \
-                                semanage port -a -t http_port_t -p "$proto" "$p" 2>/dev/null || true
-                        done
-                    done
-                    # Pre-create Caddy storage at the conventional /var/lib/caddy location
-                    # and label it so httpd_t can read/write its certs and ACME state.
-                    mkdir -p /var/lib/caddy
-                    chmod 700 /var/lib/caddy
-                    semanage fcontext -a -t httpd_var_lib_t '/var/lib/caddy(/.*)?' 2>/dev/null || true
-                    restorecon -R /var/lib/caddy 2>/dev/null || true
-                fi
-            fi
-            ;;
-        none) true ;;
-    esac
-}
-
-step_caddy_install() {
-    # Skip re-download when the Caddy binary on disk already has the requested DNS provider.
-    # Makes re-runs resilient to caddyserver.com build-API outages and supports Caddy binaries
-    # built locally via xcaddy. When the selected DNS provider differs from what's compiled in,
-    # fall through below and overwrite the binary with a fresh build containing the new module.
-    local requested_module="${DNS_CADDY_MODULE##*/}"
-    if [ -x "$CADDY_BIN" ] && "$CADDY_BIN" list-modules 2>/dev/null | grep -qF "dns.providers.${requested_module}"; then
-        return 0
-    fi
-
-    if [ "$OS" = "macos" ]; then
-        launchctl bootout "gui/$(id -u)/com.caddyserver.caddy" 2>/dev/null || true
-    else
-        systemctl stop caddy 2>/dev/null || true
-    fi
-    local url="https://caddyserver.com/api/download?os=${CADDY_OS}&arch=${ARCH}&p=${DNS_CADDY_MODULE}"
-    if [ "$OS" = "macos" ]; then
-        sudo mkdir -p "$(dirname "$CADDY_BIN")"
-        sudo curl -fsSL --max-time 600 "$url" -o "$CADDY_BIN"
-        sudo chmod +x "$CADDY_BIN"
-    else
-        curl -fsSL --max-time 600 "$url" -o "$CADDY_BIN"
-        chmod +x "$CADDY_BIN"
-    fi
-}
-
-step_caddy_configure() {
-    if [ "$OS" = "macos" ]; then
-        sudo mkdir -p "$CADDY_CONF_DIR"
-        sudo chown "$(whoami)" "$CADDY_CONF_DIR"
-    else
-        mkdir -p "$CADDY_CONF_DIR"
-    fi
-
-    # Caddyfile
-    cat > "$CADDY_CONF_DIR/Caddyfile" <<CADDYEOF
-{
-    admin off
-    email $EMAIL
-}
-
-$DOMAIN {
-    tls {
-        $DNS_TLS_BLOCK
-    }
-
-    handle /dex/* {
-        reverse_proxy localhost:5556
-    }
-
-    handle {
-        reverse_proxy localhost:3000
-    }
-}
-
-proxy.$DOMAIN, *.proxy.$DOMAIN {
-    tls {
-        $DNS_TLS_BLOCK
-    }
-
-    reverse_proxy localhost:4000
-}
-
-$DOMAIN:5050 {
-    tls {
-        $DNS_TLS_BLOCK
-    }
-    basic_auth {
-        PGADMIN_AUTH_PH
-    }
-    reverse_proxy localhost:15050
-}
-
-$DOMAIN:9001 {
-    tls {
-        $DNS_TLS_BLOCK
-    }
-    reverse_proxy localhost:19001
-}
-
-$DOMAIN:5100 {
-    tls {
-        $DNS_TLS_BLOCK
-    }
-    basic_auth {
-        REGISTRY_AUTH_PH
-    }
-    reverse_proxy localhost:15100
-}
-CADDYEOF
-
-    # Generate basicauth hashes using Caddy's own hasher — guaranteed format compatibility
-    # Hash passwords via stdin so they never appear in process arguments.
-    # Note: Caddy 2.11+ requires a newline-terminated password on stdin (the trailing \n
-    # is significant — without it the reader returns EOF before getting any input).
-    # Use the registry credentials (not the Daytona admin password) to gate the
-    # registry UI — keeping the admin login credential scoped to the dashboard.
-    local pgadmin_hash registry_hash
-    pgadmin_hash=$(printf '%s\n' "$PGADMIN_PASSWORD" | "$CADDY_BIN" hash-password)
-    registry_hash=$(printf '%s\n' "$REGISTRY_PASSWORD" | "$CADDY_BIN" hash-password)
-    _file_replace "$CADDY_CONF_DIR/Caddyfile" "PGADMIN_AUTH_PH" "$PGADMIN_EMAIL $pgadmin_hash"
-    _file_replace "$CADDY_CONF_DIR/Caddyfile" "REGISTRY_AUTH_PH" "$REGISTRY_USER $registry_hash"
-
-    # Environment file
-    printf '%s=%s\n' "$DNS_ENV_NAME" "$DNS_TOKEN" > "$CADDY_CONF_DIR/environment"
-    [ -n "${DNS_ENV_NAME_EXTRA:-}" ] && [ -n "${DNS_TOKEN_EXTRA:-}" ] && \
-        printf '%s=%s\n' "$DNS_ENV_NAME_EXTRA" "$DNS_TOKEN_EXTRA" >> "$CADDY_CONF_DIR/environment"
-    chmod 600 "$CADDY_CONF_DIR/environment"
-
-    if [ "$OS" = "macos" ]; then
-        # Wrapper script to load env vars and run Caddy
-        sudo tee /usr/local/bin/caddy-daytona > /dev/null <<WRAPEOF
-#!/bin/bash
-set -a
-source "$CADDY_CONF_DIR/environment"
-set +a
-exec "$CADDY_BIN" run --config "$CADDY_CONF_DIR/Caddyfile" --adapter caddyfile
-WRAPEOF
-        sudo chmod +x /usr/local/bin/caddy-daytona
-
-        # LaunchAgent plist
-        mkdir -p "$HOME/Library/LaunchAgents"
-        cat > "$HOME/Library/LaunchAgents/com.caddyserver.caddy.plist" <<'PLISTEOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.caddyserver.caddy</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/caddy-daytona</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/usr/local/var/log/caddy/access.log</string>
-    <key>StandardErrorPath</key>
-    <string>/usr/local/var/log/caddy/error.log</string>
-</dict>
-</plist>
-PLISTEOF
-        sudo mkdir -p /usr/local/var/log/caddy
-        sudo chown "$(whoami)" /usr/local/var/log/caddy
-        launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.caddyserver.caddy.plist"
-    else
-        # Systemd unit
-        cat > /etc/systemd/system/caddy.service <<'SVCEOF'
-[Unit]
-Description=Caddy web server
-After=network.target network-online.target
-Requires=network-online.target
-
-[Service]
-# Caddy stores certs/state at $XDG_DATA_HOME/caddy and autosave at $XDG_CONFIG_HOME/caddy.
-# Pointing both at /var/lib puts everything in /var/lib/caddy — the conventional location,
-# matches Fedora's packaged caddy, and avoids any /root home-directory traversal under SELinux.
-Environment=XDG_DATA_HOME=/var/lib
-Environment=XDG_CONFIG_HOME=/var/lib
-EnvironmentFile=/etc/caddy/environment
-ExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
-ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
-TimeoutStopSec=5s
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-        systemctl daemon-reload
-        systemctl enable --now caddy
-
-        # If Caddy failed to start, run it directly to capture the actual error
-        if ! systemctl is-active --quiet caddy; then
-            echo "Caddy failed to start via systemd. Capturing error:"
-            (set -a; source "$CADDY_CONF_DIR/environment"; set +a
-             timeout 5 "$CADDY_BIN" run --config "$CADDY_CONF_DIR/Caddyfile" --adapter caddyfile 2>&1) || true
-            return 1
-        fi
-    fi
 }
 
 step_docker_start() {
@@ -841,83 +537,23 @@ step_verify() {
         ok "Dex OIDC issuer"; passed=$((passed+1))
     else fail "Dex OIDC issuer"; failed=$((failed+1)); fi
 
-    # DNS — use host(1) on macOS, getent on Linux
+    # Local HTTP services that nginx should reverse-proxy.
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:3000" 2>/dev/null || echo "000")
+    case "$code" in 200|301|302|404) ok "Local API/dashboard port 3000"; passed=$((passed+1)) ;; *) fail "Local API/dashboard port 3000 (HTTP $code)"; failed=$((failed+1)) ;; esac
+
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:4000" 2>/dev/null || echo "000")
+    case "$code" in 200|301|302|404) ok "Local proxy port 4000"; passed=$((passed+1)) ;; *) fail "Local proxy port 4000 (HTTP $code)"; failed=$((failed+1)) ;; esac
+
+    # SSH Gateway — nc for macOS, bash /dev/tcp for Linux.
     if [ "$OS" = "macos" ]; then
-        if host "$DOMAIN" >/dev/null 2>&1; then
-            ok "Base domain DNS"; passed=$((passed+1))
-        else fail "Base domain DNS"; failed=$((failed+1)); fi
-
-        if host "proxy.$DOMAIN" >/dev/null 2>&1; then
-            ok "Proxy wildcard DNS"; passed=$((passed+1))
-        else fail "Proxy wildcard DNS"; failed=$((failed+1)); fi
+        if nc -z -w 5 127.0.0.1 2222 2>/dev/null; then
+            ok "Local SSH Gateway port 2222"; passed=$((passed+1))
+        else fail "Local SSH Gateway port 2222"; failed=$((failed+1)); fi
     else
-        if getent hosts "$DOMAIN" >/dev/null 2>&1; then
-            ok "Base domain DNS"; passed=$((passed+1))
-        else fail "Base domain DNS"; failed=$((failed+1)); fi
-
-        if getent hosts "proxy.$DOMAIN" >/dev/null 2>&1; then
-            ok "Proxy wildcard DNS"; passed=$((passed+1))
-        else fail "Proxy wildcard DNS"; failed=$((failed+1)); fi
-    fi
-
-    # HTTPS — wait up to 120s for TLS certificate
-    info "Waiting for TLS certificate (up to 120s)..."
-    local https_ok=false code=""
-    for _ in $(seq 1 24); do
-        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://$DOMAIN" 2>/dev/null || echo "000")
-        case "$code" in 200|301|302) https_ok=true; break ;; esac
-        sleep 5
-    done
-    if $https_ok; then ok "HTTPS dashboard (HTTP $code)"; passed=$((passed+1))
-    else
-        fail "HTTPS dashboard (HTTP $code)"; failed=$((failed+1))
-        # Check if Caddy is running and diagnose why TLS failed
-        if [ "$OS" != "macos" ]; then
-            if ! systemctl is-active --quiet caddy 2>/dev/null; then
-                warn "Caddy is not running — check: systemctl status caddy.service"
-            else
-                # Caddy is running but TLS failed — check for rate limiting
-                local caddy_err
-                caddy_err=$(journalctl -u caddy.service --since "5 min ago" --no-pager 2>/dev/null || true)
-                if echo "$caddy_err" | grep -qi "rateLimited" 2>/dev/null; then
-                    local retry_time
-                    retry_time=$(echo "$caddy_err" | grep -o 'retry after [0-9A-Z: -]*' | tail -1)
-                    warn "Let's Encrypt rate limit hit — $retry_time"
-                    warn "Caddy will retry automatically. Leave it running."
-                elif echo "$caddy_err" | grep -qi "error" 2>/dev/null; then
-                    warn "Caddy reported errors — check: journalctl -u caddy.service --no-pager | tail -20"
-                else
-                    warn "TLS certificates may still be issuing. Caddy is running and will retry."
-                fi
-            fi
-        fi
-    fi
-
-    # Wildcard TLS
-    local proxy_ip
-    if [ "$OS" = "macos" ]; then
-        proxy_ip=$(dig +short "proxy.$DOMAIN" A 2>/dev/null | head -1)
-    else
-        proxy_ip=$(getent hosts "proxy.$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)
-    fi
-    if [ -n "$proxy_ip" ]; then
-        local san
-        san=$(echo | openssl s_client -servername "test.proxy.$DOMAIN" -connect "$proxy_ip:443" 2>/dev/null \
-            | openssl x509 -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" || true)
-        if echo "$san" | grep -q "\\*.proxy.$DOMAIN"; then
-            ok "Wildcard TLS certificate"; passed=$((passed+1))
-        else fail "Wildcard TLS certificate (may still be issuing)"; failed=$((failed+1)); fi
-    else fail "Wildcard TLS certificate (proxy DNS not resolving)"; failed=$((failed+1)); fi
-
-    # SSH Gateway — nc for macOS (no timeout command), bash /dev/tcp for Linux
-    if [ "$OS" = "macos" ]; then
-        if nc -z -w 5 "$DOMAIN" 2222 2>/dev/null; then
-            ok "SSH Gateway port 2222"; passed=$((passed+1))
-        else fail "SSH Gateway port 2222"; failed=$((failed+1)); fi
-    else
-        if timeout 5 bash -c "echo >/dev/tcp/$DOMAIN/2222" 2>/dev/null; then
-            ok "SSH Gateway port 2222"; passed=$((passed+1))
-        else fail "SSH Gateway port 2222"; failed=$((failed+1)); fi
+        if timeout 5 bash -c "echo >/dev/tcp/127.0.0.1/2222" 2>/dev/null; then
+            ok "Local SSH Gateway port 2222"; passed=$((passed+1))
+        else fail "Local SSH Gateway port 2222"; failed=$((failed+1)); fi
     fi
 
     printf "\n  %d passed, %d failed\n" "$passed" "$failed"
@@ -925,44 +561,110 @@ step_verify() {
     if [ "$failed" -eq 0 ]; then
         printf "\n${GREEN}${BOLD}  Setup complete!${NC}\n"
     else
-        printf "\n${YELLOW}  Some checks failed. TLS certificates may still be issuing — retry in a few minutes.${NC}\n"
+        printf "\n${YELLOW}  Some local checks failed. Check Docker logs before configuring nginx.${NC}\n"
     fi
+}
 
-    printf "\n${BOLD}  Endpoints${NC}\n"
-    printf "  ─────────\n"
+print_nginx_instructions() {
+    printf "\n${BOLD}  Configure nginx${NC}\n"
+    printf "  ───────────────\n"
+    printf "  DNS records needed:\n"
+    printf "    %s -> this server\n" "$DOMAIN"
+    printf "    proxy.%s and *.proxy.%s -> this server\n" "$DOMAIN" "$DOMAIN"
+    printf "    Optional: pgadmin.%s, minio.%s, registry.%s -> this server\n" "$DOMAIN" "$DOMAIN" "$DOMAIN"
+    printf "\n  nginx should terminate TLS and proxy to localhost-only Docker ports:\n\n"
+
+    cat <<NGINXEOF
+# Put this map in nginx's http context if you do not already have it.
+map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $DOMAIN;
+
+    # ssl_certificate ...;
+    # ssl_certificate_key ...;
+
+    client_max_body_size 0;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+    }
+
+    location /dex/ {
+        proxy_pass http://127.0.0.1:5556;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name proxy.$DOMAIN *.proxy.$DOMAIN;
+
+    # ssl_certificate must cover proxy.$DOMAIN and *.proxy.$DOMAIN;
+    # ssl_certificate_key ...;
+
+    client_max_body_size 0;
+
+    location / {
+        proxy_pass http://127.0.0.1:4000;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+
+# Optional admin tools. Restrict them with nginx auth/IP allowlists.
+server { listen 443 ssl http2; server_name pgadmin.$DOMAIN;  location / { proxy_pass http://127.0.0.1:5050; proxy_set_header Host \$host; proxy_set_header X-Forwarded-Proto https; } }
+server { listen 443 ssl http2; server_name minio.$DOMAIN;    location / { proxy_pass http://127.0.0.1:9001; proxy_set_header Host \$host; proxy_set_header X-Forwarded-Proto https; } }
+server { listen 443 ssl http2; server_name registry.$DOMAIN; location / { proxy_pass http://127.0.0.1:5100; proxy_set_header Host \$host; proxy_set_header X-Forwarded-Proto https; } }
+
+# Optional TCP stream proxy for Daytona SSH access:
+# stream { server { listen 2222; proxy_pass 127.0.0.1:2222; } }
+NGINXEOF
+
+    printf "\n${BOLD}  Endpoints after nginx is configured${NC}\n"
     printf "  Dashboard:   https://%s\n" "$DOMAIN"
     printf "               Login: %s\n" "$ADMIN_EMAIL"
-    printf "  PgAdmin:     https://%s:5050\n" "$DOMAIN"
-    printf "               Basic Auth: %s / (password set during setup)\n" "$PGADMIN_EMAIL"
-    printf "               PgAdmin Login: same email and password\n"
-    printf "  MinIO:       https://%s:9001\n" "$DOMAIN"
-    printf "               Login: %s / (password set during setup)\n" "$MINIO_USER"
-    printf "  Registry UI: https://%s:5100\n" "$DOMAIN"
-    printf "               Basic Auth: %s / (registry password set during setup)\n" "$REGISTRY_USER"
+    printf "  Sandbox URLs: https://<port>-<sandbox-id>.proxy.%s\n" "$DOMAIN"
+    printf "  SSH Gateway: %s:2222, if you enable the nginx stream proxy\n" "$DOMAIN"
+    printf "  PgAdmin:     https://pgadmin.%s\n" "$DOMAIN"
+    printf "  MinIO:       https://minio.%s\n" "$DOMAIN"
+    printf "  Registry UI: https://registry.%s\n" "$DOMAIN"
     printf "\n"
 }
 
 # ── Main ────────────────────────────────────────────────────
 main() {
-    # Root required on Linux, not on macOS (uses sudo where needed)
-    if [ "$(uname -s)" != "Darwin" ] && [ "$(id -u)" -ne 0 ]; then
-        die "This script must be run as root"
-    fi
-
     detect_platform
     collect_input
 
     printf "\n${BOLD}  Setting up Daytona...${NC}\n\n"
 
     run_step "Cleaning previous installation"    step_clean
-    run_step "Installing system packages"        step_packages
+    run_step "Checking prerequisites"            step_prerequisites
     run_step "Cloning Daytona repository"        step_clone
     run_step "Generating security credentials"   step_secrets
     run_step "Configuring Dex OIDC provider"     step_dex
     run_step "Configuring Docker Compose"        step_compose
-    run_step "Configuring firewall rules"        step_firewall
-    run_step "Installing Caddy with DNS module"  step_caddy_install
-    run_step "Configuring Caddy reverse proxy"   step_caddy_configure
     run_step "Starting Docker services"          step_docker_start
 
     # Pull sandbox image with visible progress (blocking — sandboxes won't work without it)
@@ -974,6 +676,7 @@ main() {
     fi
 
     step_verify
+    print_nginx_instructions
 }
 
 main "$@"
