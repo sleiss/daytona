@@ -519,6 +519,20 @@ step_docker_start() {
 step_verify() {
     local cf="$REPO_DIR/docker/docker-compose.yaml"
     local passed=0 failed=0
+    local code=""
+
+    _wait_http_code() {
+        local url="$1" ok_codes="$2" deadline=$(( $(date +%s) + 90 ))
+        code="000"
+        while true; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null || true)
+            case " $ok_codes " in
+                *" $code "*) return 0 ;;
+            esac
+            [ "$(date +%s)" -gt "$deadline" ] && return 1
+            sleep 3
+        done
+    }
 
     printf "\n${BOLD}  Verification Results${NC}\n\n"
 
@@ -538,12 +552,17 @@ step_verify() {
     else fail "Dex OIDC issuer"; failed=$((failed+1)); fi
 
     # Local HTTP services that nginx should reverse-proxy.
-    local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:3000" 2>/dev/null || echo "000")
-    case "$code" in 200|301|302|404) ok "Local API/dashboard port 3000"; passed=$((passed+1)) ;; *) fail "Local API/dashboard port 3000 (HTTP $code)"; failed=$((failed+1)) ;; esac
+    if _wait_http_code "http://127.0.0.1:3000" "200 301 302 404"; then
+        ok "Local API/dashboard port 3000"; passed=$((passed+1))
+    else
+        fail "Local API/dashboard port 3000 (HTTP $code)"; failed=$((failed+1))
+    fi
 
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:4000" 2>/dev/null || echo "000")
-    case "$code" in 200|301|302|404) ok "Local proxy port 4000"; passed=$((passed+1)) ;; *) fail "Local proxy port 4000 (HTTP $code)"; failed=$((failed+1)) ;; esac
+    if _wait_http_code "http://127.0.0.1:4000" "200 301 302 404"; then
+        ok "Local proxy port 4000"; passed=$((passed+1))
+    else
+        fail "Local proxy port 4000 (HTTP $code)"; failed=$((failed+1))
+    fi
 
     # SSH Gateway — nc for macOS, bash /dev/tcp for Linux.
     if [ "$OS" = "macos" ]; then
