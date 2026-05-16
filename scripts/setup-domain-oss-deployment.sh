@@ -33,7 +33,7 @@ REGISTRY_USER="" REGISTRY_PASSWORD=""
 HEALTH_CHECK_KEY="" OTEL_COLLECTOR_KEY=""
 CLICKHOUSE_ENABLED="" CLICKHOUSE_HOST_VAL="" CLICKHOUSE_PORT_VAL=""
 CLICKHOUSE_USER="" CLICKHOUSE_PASS="" CLICKHOUSE_DB_VAL="" CLICKHOUSE_PROTO=""
-REPO_DIR="$HOME/daytona"
+REPO_DIR="${REPO_DIR:-$HOME/daytona}"
 
 # ── Helpers ─────────────────────────────────────────────────
 info()    { printf "  ${CYAN}▸${NC} %s\n" "$*"; }
